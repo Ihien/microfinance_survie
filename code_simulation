@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+simulate_dynamic_multistate.py
+
+Simulation + estimation de modèles de survie dynamiques & multi-états
+pour la microfinance. Compatible lifelines 0.30+ et scikit-survival 0.24+.
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.linalg import expm
+from tqdm import tqdm
+
+# ------------------------------------------------------------------#
+# 1. PARAMÈTRES GLOBAUX                                              #
+# ------------------------------------------------------------------#
+np.random.seed(42)
+
+N_CLIENTS = 4_000          # taille du portefeuille
+T_MAX     = 540            # horizon (jours)
+DT        = 1              # pas de discretisation (jour)
+STATES    = {0: "on_time",
+             1: "1_30",
+             2: "31_60",
+             3: "default"}
+K         = max(STATES)    # état de défaut
+
+# intensités de base pour chaque transition  r -> s  (par jour)
+BASE_LAMBDA = {(0, 1): 1.0e-3,
+               (1, 2): 8.0e-3,
+               (2, 3): 3.0e-2}
+
+#  coefficients (splines implicites) : ici on les fait varier
+#   β(t) = b0 + b1 * sin(2π t / P)   où P≈1 an
+P_SIN = 365
+BETA_TIME = {           # pour la 1re transition uniquement (exemple)
+    "amount_outstanding":  np.array([ 0.8,  0.6]),
+    "str_ratio"        :  np.array([ 1.4,  1.1]),
+    "weather_index"    :  np.array([-0.3, -0.5]),
+    "inflation"        :  np.array([ 0.7,  0.9]),
+}
+
+GAMMA_TIME = {          # même logique pour 2e et 3e transitions
+    (1, 2): {
+        "amount_outstanding": np.array([0.9, 0.8]),
+        "str_ratio":          np.array([1.1, 0.9]),
+        "weather_index":      np.array([-0.4, -0.6]),
+        "inflation":          np.array([0.6, 0.8]),
+    },
+    (2, 3): {
+        "amount_outstanding": np.array([1.0, 1.1]),
+        "str_ratio":          np.array([1.3, 1.0]),
+        "weather_index":      np.array([-0.2, -0.3]),
+        "inflation":          np.array([0.8, 1.2]),
+    }
+}
+
+# ------------------------------------------------------------------#
+# 2. GÉNÉRATION DES COVARIABLES DYNAMIQUES                           #
+# ------------------------------------------------------------------#
+def simulate_covariates(n, t_max):
+    """Retourne un dict {var: array(n, t_max)} pour chaque covariable."""
+    time = np.arange(t_max)
+
+    amount_start = np.random.lognormal(mean=9.1, sigma=0.6, size=n)  # FCFA
+    amount_mat   = amount_start[:, None] * (1 - time / t_max * 0.8)  # amortissement linéaire
+
+    service_income_base = np.random.uniform(0.1, 0.4, size=n)
+    str_ratio_mat = service_income_base[:, None] * (
+        1 + 0.15 * np.sin(2 * np.pi * time / P_SIN) + 
+        0.10 * np.random.normal(0, 1, (n, t_max)))
+
+    weather = 0.5 + 0.5 * np.sin(2 * np.pi * time / P_SIN + np.pi/4)
+    weather_mat = weather[None, :] + 0.05 * np.random.normal(size=(n, t_max))
+
+    inflation_trend = 0.02 + 0.00005 * time            # ≃ 2 % + drift
+    inflation_mat = inflation_trend[None, :] + 0.002 * np.random.normal(size=(n, t_max))
+
+    return dict(amount_outstanding=amount_mat,
+                str_ratio=str_ratio_mat,
+                weather_index=weather_mat,
+                inflation=inflation_mat)
+
+# ------------------------------------------------------------------#
+# 3. SIMULATION DU PROCESSUS MULTI-ÉTATS                             #
+# ------------------------------------------------------------------#
+def time_coef(val0, val1, t):
+    """β(t) = val0 + (val1 - val0) * sin(2πt/P)/2  (simple lissage)"""
+    return val0 + (val1 - val0) * 0.5 * (1 + np.sin(2*np.pi*t/P_SIN))
+
+def int_transition(r, s, t, covs, idx):
+    """Intensité λ_rs(t) pour l’individu idx au temps t."""
+    lam0 = BASE_LAMBDA[(r, s)]
+    # choisir les bons coefficients
+    coef_dict = BETA_TIME if (r, s) == (0, 1) else GAMMA_TIME[(r, s)]
+    linpred  = 0.
+    for k, mat in covs.items():
+        b0, b1 = coef_dict[k]
+        beta_ts = time_coef(b0, b1, t)
+        linpred += beta_ts * mat[idx, t]
+    return lam0 * np.exp(linpred)
+
+def simulate_paths(covs, t_max=T_MAX, dt=DT):
+    records = []                         # long format : un enregistrement par intervalle
+    n = next(iter(covs.values())).shape[0]
+
+    for i in tqdm(range(n), desc="simulate"):
+        state, t = 0, 0
+        while t < t_max and state != K:
+            next_t = t + dt
+            # intensité sortie de l’état courant vers state+1 (chaîne ordonnée)
+            lam = int_transition(state, state+1, t, covs, i)
+            # probabilité de transition pendant [t, t+dt)
+            p_jump = 1 - np.exp(-lam * dt)
+            if np.random.rand() < p_jump:
+                # événement
+                event_state = state + 1
+                rec = dict(id=i, start=t, stop=next_t,
+                           event=1, state_from=state,
+                           state_to=event_state)
+                # ajouter covariables au même instant
+                for k, mat in covs.items():
+                    rec[k] = mat[i, t]
+                records.append(rec)
+                state = event_state
+            else:
+                # intervalle sans événement : event=0
+                rec = dict(id=i, start=t, stop=next_t,
+                           event=0, state_from=state,
+                           state_to=state)
+                for k, mat in covs.items():
+                    rec[k] = mat[i, t]
+                records.append(rec)
+            t = next_t
+    return pd.DataFrame.from_records(records)
+
+covs   = simulate_covariates(N_CLIENTS, T_MAX)
+df_long = simulate_paths(covs)
+
+# ------------------------------------------------------------------#
+# 4. ESTIMATION COX DYNAMIQUE (transition 0 → 1)                    #
+# ------------------------------------------------------------------#
+from lifelines import CoxTimeVaryingFitter
+from patsy import dmatrix
+
+# sélectionner seulement les transitions à risque depuis état 0
+risk0 = df_long[df_long.state_from.eq(0)].copy()
+# créer base splines sur le temps (stop) et interactions avec covariables
+risk0["time_bs"] = list(dmatrix("bs(stop, df=4, degree=3, include_intercept=False)",
+                                {"stop": risk0["stop"]}, return_type='dataframe').values)
+bs_cols = [f"bs{j}" for j in range(4)]
+bs_mat  = np.stack(risk0.pop("time_bs"))
+risk0[bs_cols] = bs_mat
+
+# interactions spline × covariable
+for var in ["amount_outstanding", "str_ratio", "weather_index", "inflation"]:
+    for j in range(4):
+        risk0[f"{var}_bs{j}"] = risk0[var] * risk0[bs_cols[j]]
+
+ctv = CoxTimeVaryingFitter(penalizer=1.0, l1_ratio=0.0)
+ctv.fit(risk0, id_col="id", start_col="start", stop_col="stop",
+        event_col="event",
+        show_progress=True)
+
+print("\n— Cox dynamique transition 0→1 —")
+print(ctv.summary.iloc[:8, :6])        # afficher qq coefficients
+
+# ------------------------------------------------------------------#
+# 5. COX CAUSE-SPÉCIFIQUE MULTI-ÉTATS                                #
+# ------------------------------------------------------------------#
+from lifelines.utils import k_fold_cross_validation
+transitions = [(0, 1), (1, 2), (2, 3)]
+cox_trans   = {}
+
+for (r, s) in transitions:
+    sub = df_long[df_long.state_from.eq(r)].copy()
+    label = (sub.state_to == s).astype(int)
+    sub["event"] = label
+    ctv_rs = CoxTimeVaryingFitter(penalizer=1.0)
+    ctv_rs.fit(sub, id_col="id", start_col="start", stop_col="stop",
+               event_col="event", show_progress=False)
+    cox_trans[(r, s)] = ctv_rs
+    print(f"\n— Cox {r}->{s}: concordance = {ctv_rs.concordance_index_:.3f}")
+
+# ------------------------------------------------------------------#
+# 6. PROBABILITÉ D’ATTEINDRE LE DÉFAUT EN 90 JOURS                   #
+# ------------------------------------------------------------------#
+def hazard_01(row, t):
+    # intensité à l’instant t (approx = au centre de l’intervalle)
+    return np.exp(ctv.predict_partial_hazard(row.to_frame().T)).values[0]
+
+def path_prob_default_90(row0):
+    """Probabilité estimée d’être en défaut à 90 j (intégration simple)."""
+    # état 0 initial
+    p = np.zeros(K+1)
+    p[0] = 1.0
+    for day in range(int(row0.start), int(row0.start+90)):
+        # covariables et temps : prendre le dernier enregistrement dispo
+        row_day = row0.copy()
+        row_day["stop"] = day + 0.5
+        haz01 = hazard_01(row_day, day)
+        # matrices de transitions exponentielles (simplifié ordre 1)
+        Q = np.zeros((K+1, K+1))
+        Q[0, 0] = -haz01
+        Q[0, 1] = haz01
+        # on suppose intensités 1->2 et 2->3 constantes estimées (moyenne)
+        Q[1, 1] = -0.006
+        Q[1, 2] = 0.006
+        Q[2, 2] = -0.02
+        Q[2, 3] = 0.02
+        P = expm(Q)        # pas = 1 jour
+        p = p @ P
+    return p[3]
+
+# prédire pour 200 clients aléatoires
+sample_ids = np.random.choice(df_long.id.unique(), 200, replace=False)
+first_rows = (df_long.groupby("id").first().loc[sample_ids])
+
+probs = first_rows.apply(path_prob_default_90, axis=1)
+print(f"\nProbabilité moyenne d’atteindre le défaut en 90 j (échantillon) : "
+      f"{probs.mean():.3%}")
+
+ALERT_THRESHOLD = 0.10
+n_alerts = (probs > ALERT_THRESHOLD).sum()
+print(f"Clients avec alerte (> {ALERT_THRESHOLD:.0%}) : {n_alerts}/{len(probs)}")
+
+# ------------------------------------------------------------------#
+# 7. ÉVALUATION RAPIDE (c-index, Brier)                              #
+# ------------------------------------------------------------------#
+from sksurv.metrics import concordance_index_ipcw, integrated_brier_score
+from sksurv.util import Surv
+
+# convertir pour sksurv : durée jusqu'à premier défaut ou censure
+df_def = df_long.groupby("id").apply(
+    lambda g: g[g.state_to == 3].head(1)
+              if (g.state_to == 3).any()
+              else g.tail(1)
+).reset_index(drop=True)
+
+event = (df_def.state_to == 3).values
+time  = df_def.stop.values
+
+y_true = Surv.from_arrays(event, time)
+scores = ctv.predict_partial_hazard(risk0.groupby("id").first())
+c_idx  = concordance_index_ipcw(y_true, y_true, scores.values.ravel())[0]
+print(f"\nC-index global (premier défaut) : {c_idx:.3f}")
+
+# Note : Brier + IBS sur horizon 540 j
+times_eval = np.linspace(30, 540, 50)
+risk_scores = ctv.predict_survival_function(risk0.groupby("id").first(),
+                                            times=times_eval, return_array=True)
+ibs = integrated_brier_score(y_true, y_true, risk_scores.T, times_eval)
+print(f"Integrated Brier Score : {ibs:.4f}")
+
+# ------------------------------------------------------------------#
+# FIN                                                               #
+# ------------------------------------------------------------------#
